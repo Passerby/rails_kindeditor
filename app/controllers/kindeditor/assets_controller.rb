@@ -3,118 +3,55 @@ require "find"
 class Kindeditor::AssetsController < ApplicationController
   skip_before_filter :verify_authenticity_token
   def create
-    @imgFile, @dir = params[:imgFile], params[:dir]
-    unless @imgFile.nil?
-      if Kindeditor::AssetUploader.save_upload_info? # save upload info into database
-        begin
-          @asset = "Kindeditor::#{@dir.camelize}".constantize.new(:asset => @imgFile)
-          @asset.owner_id = params[:owner_id] ? params[:owner_id] : 0
-          logger.warn '========= Warning: the owner_id is 0, "delete uploaded files automatically" will not work. =========' if defined?(logger) && @asset.owner_id == 0
-          @asset.asset_type = @dir
-          if @asset.save
-            render :text => ({:error => 0, :url => @asset.asset.url}.to_json)
-          else
-            show_error(@asset.errors.full_messages)
-          end
-        rescue Exception => e
-          show_error(e.to_s)
-        end
-      else # do not touch database
-        begin
-          uploader = "Kindeditor::#{@dir.camelize}Uploader".constantize.new
-          uploader.store!(@imgFile)
-          render :text => ({:error => 0, :url => uploader.url}.to_json)
-        rescue CarrierWave::UploadError => e
-          show_error(e.message)
-        rescue Exception => e
-          show_error(e.to_s)
-        end
-      end
+    imgFile, dir = params[:imgFile], params[:dir]
+    unless imgFile.nil?
+      bucket = Qiniu::SelfConfig::BUCKET
+      put_policy = Qiniu::Auth::PutPolicy.new(bucket)
+      date = Time.now
+      code, result, response_headers = Qiniu::Storage.upload_with_put_policy(
+        put_policy,                # 上传策略
+        imgFile.tempfile.path,     # 本地文件名
+        "products/#{date.year}/#{date.month}/#{date.day}/#{date.to_i}.#{ imgFile.tempfile.path.gsub(/.*\./,"") }" # 最终资源名，可省略，缺省为上传策略 scope 字段中指定的Key值
+      )
+
+      current_url = Qiniu::SelfConfig::DOMAIN
+      render json: { error: 0, url: "#{current_url}/#{ result['key'] }" }
+
     else
       show_error("No File Selected!")
     end
   end
 
   def list
-    @root_path = "#{Rails.public_path}/#{RailsKindeditor.upload_store_dir}/"
-    @root_url = "/#{RailsKindeditor.upload_store_dir}/"
-    @img_ext = Kindeditor::AssetUploader::EXT_NAMES[:image]
-    @dir = params[:dir].strip || ""
-    unless Kindeditor::AssetUploader::EXT_NAMES.keys.map(&:to_s).push("").include?(@dir)
-      render :text => "Invalid Directory name."
-      return
-    end
-    
-    Dir.chdir(Rails.public_path)
-    RailsKindeditor.upload_store_dir.split('/').each do |dir|
-      Dir.mkdir(dir) unless Dir.exist?(dir)
-      Dir.chdir(dir)
-    end
-    
-    Dir.mkdir(@dir) unless Dir.exist?(@dir)
-    
-    @root_path += @dir + "/"
-    @root_url += @dir + "/"
-    
-    @path = params[:path].strip || ""
-    if @path.empty?
-      @current_path = @root_path
-      @current_url = @root_url
-      @current_dir_path = ""
-      @moveup_dir_path = ""
-    else
-      @current_path = @root_path + @path + "/"      
-      @current_url = @root_url + @path + "/"
-      @current_dir_path = @path
-      @moveup_dir_path = @current_dir_path.gsub(/(.*?)[^\/]+\/$/, "")
-    end
-    @order = %w(name size type).include?(params[:order].downcase) ? params[:order].downcase : "name"
-    if !@current_path.match(/\.\./).nil?
-      render :text => "Access is not allowed."
-      return
-    end
-    if @current_path.match(/\/$/).nil?
-      render :text => "Parameter is not valid."
-      return
-    end
-    if !File.exist?(@current_path) || !File.directory?(@current_path)
-      render :text => "Directory does not exist."
-      return
-    end
-    @file_list = []
-    Dir.foreach(@current_path) do |filename|  
-      hash = {}
-      if filename != "." and filename != ".." and filename != ".DS_Store"
-        file = @current_path + filename
-        if File.directory?(file)
-          hash[:is_dir] = true
-          hash[:has_file] = (Dir.foreach(file).count > 2)
-          hash[:filesize] = 0
-          hash[:is_photo] = false
-          hash[:filetype] = ""
-        else
-          hash[:is_dir] = false
-          hash[:has_file] = false
-          hash[:filesize] = File.size(file)
-          hash[:dir_path] = ""
-          file_ext = file.gsub(/.*\./,"")
-          hash[:is_photo] = @img_ext.include?(file_ext)
-          hash[:filetype] = file_ext
-        end
-        hash[:filename] = filename
-        hash[:datetime] = File.mtime(file).to_s(:db)
-        @file_list << hash
+    bucket = Qiniu::SelfConfig::BUCKET
+    current_url = Qiniu::SelfConfig::DOMAIN
+    qiniu_list_policy = Qiniu::Storage::ListPolicy.new(bucket, 1000, params[:path], '/')
+    code, result, response_headers = Qiniu::Storage.list(qiniu_list_policy)
+
+    file_list = []
+    unless result["commonPrefixes"].nil?
+      result["commonPrefixes"].each do |dir|
+        file_list << { is_dir: true, has_file: true, filesize: 0, is_photo: false, filetype: '',
+         filename: dir[0..dir.length - 2], datetime: '' }
       end
     end
 
-    @file_list.sort! {|a, b| a["file#{@order}".to_sym] <=> b["file#{@order}".to_sym]}
-    
-    @result = {}
-    @result[:moveup_dir_path] = @moveup_dir_path
-    @result[:current_dir_path] = @current_dir_path
-    @result[:current_url] = @current_url
-    @result[:total_count] = @file_list.count
-    @result[:file_list] = @file_list
+    unless result["items"].nil?
+      result["items"].each do |f|
+        file_list << { is_dir: false, has_file: false, filesize: f['fsize'], is_photo: f['mimeType'].include?('image'),
+         dir_path: '', filetype: f['key'].gsub(/.*\./,""), filename: f['key'],
+         datetime: Time.at(f['putTime']/1000_0000).strftime("%Y-%m-%d %l:%M:%S") }
+      end
+    end
+
+    @result = {
+      moveup_dir_path: '',
+      current_dir_path: '',
+      current_url: current_url,
+      file_list: file_list,
+      total_count: file_list.count
+    }
+
     render :text => @result.to_json
   end
   
